@@ -43,6 +43,7 @@ on:
         options:
           - "ubuntu-latest"
           - "macos-latest"
+          - "macos-13"
       requirements:
         description: "Comma separated requirements"
         required: true
@@ -60,6 +61,10 @@ jobs:
     runs-on: ${{ github.event.inputs.os }}
     steps:
       - name: Checkout python-for-android
+        uses: actions/checkout@v4
+      - name: Setup Docker on macOS
+        if: runner.os == 'macOS'
+        uses: douglascamata/setup-docker-macos-action@v1-alpha
         uses: actions/checkout@v6
       - name: Pull the python-for-android docker image
         run: make docker/pull
