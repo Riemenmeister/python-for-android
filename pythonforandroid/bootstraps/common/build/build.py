@@ -20,6 +20,7 @@ import time
 from fnmatch import fnmatch
 import jinja2
 
+from pythonforandroid.bootstrap import SDL_BOOTSTRAPS
 from pythonforandroid.util import rmdir, ensure_dir, max_build_tool_version
 
 
@@ -83,7 +84,7 @@ else:
 if PYTHON is not None and not exists(PYTHON):
     PYTHON = None
 
-if _bootstrap_name in ('sdl2', 'webview', 'service_only', 'qt'):
+if _bootstrap_name in ('sdl2', 'sdl3', 'webview', 'service_only', 'qt'):
     WHITELIST_PATTERNS.append('pyconfig.h')
 
 environment = jinja2.Environment(loader=jinja2.FileSystemLoader(
@@ -92,6 +93,73 @@ environment = jinja2.Environment(loader=jinja2.FileSystemLoader(
 
 DEFAULT_PYTHON_ACTIVITY_JAVA_CLASS = 'org.kivy.android.PythonActivity'
 DEFAULT_PYTHON_SERVICE_JAVA_CLASS = 'org.kivy.android.PythonService'
+# Google Play's documented maximum Android versionCode.
+# https://developer.android.com/tools/publishing/versioning
+MAX_ANDROID_VERSION_CODE = 2100000000
+
+
+def get_android_numeric_version(version, min_sdk_version):
+    """
+    Generate the default Android versionCode value from --version.
+
+    The format is (10 + minsdk + app_version). Older versioning was
+    (arch + minsdk + app_version), with arch expressed with a single digit
+    from 6 to 9. Since multi-arch support, this uses 10.
+    """
+    version_code = 0
+    try:
+        for part in version.split('.'):
+            version_code *= 100
+            version_code += int(part)
+    except ValueError as exc:
+        raise ValueError(
+            "Could not generate Android versionCode from --version "
+            "{!r}. --version is Android versionName; when it is not numeric "
+            "dot-separated text, set --numeric-version to a positive Android "
+            "versionCode integer no greater than {}.".format(
+                version, MAX_ANDROID_VERSION_CODE
+            )
+        ) from exc
+    return "{}{}{}".format("10", min_sdk_version, version_code)
+
+
+def validate_android_numeric_version(numeric_version, *, generated_from_version=None):
+    try:
+        normalized_version = int(numeric_version)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "--numeric-version must be a decimal integer Android versionCode "
+            "greater than 0 and no greater than {}; got {!r}.".format(
+                MAX_ANDROID_VERSION_CODE, numeric_version
+            )
+        ) from exc
+
+    if normalized_version <= 0:
+        raise ValueError(
+            "--numeric-version must be a positive Android versionCode "
+            "greater than 0; got {!r}.".format(numeric_version)
+        )
+
+    if normalized_version > MAX_ANDROID_VERSION_CODE:
+        if generated_from_version is not None:
+            raise ValueError(
+                "Generated Android versionCode {} from --version {!r}, "
+                "which exceeds the maximum {}. --version is Android "
+                "versionName; keep this display version by setting "
+                "--numeric-version to a positive Android versionCode no "
+                "greater than {}.".format(
+                    normalized_version,
+                    generated_from_version,
+                    MAX_ANDROID_VERSION_CODE,
+                    MAX_ANDROID_VERSION_CODE,
+                )
+            )
+        raise ValueError(
+            "--numeric-version is Android versionCode and must not exceed "
+            "{}; got {!r}.".format(MAX_ANDROID_VERSION_CODE, numeric_version)
+        )
+
+    return str(normalized_version)
 
 
 def render(template, dest, **kwargs):
@@ -218,6 +286,10 @@ def compile_py_file(python_file, optimize_python=True):
         exit(1)
 
     return ".".join([os.path.splitext(python_file)[0], "pyc"])
+
+
+def is_sdl_bootstrap():
+    return get_bootstrap_name() in SDL_BOOTSTRAPS
 
 
 def make_package(args):
@@ -415,19 +487,17 @@ main.py that loads it.''')
     versioned_name = (args.name.replace(' ', '').replace('\'', '') +
                       '-' + args.version)
 
-    version_code = 0
-    if not args.numeric_version:
-        """
-        Set version code in format (10 + minsdk + app_version)
-        Historically versioning was (arch + minsdk + app_version),
-        with arch expressed with a single digit from 6 to 9.
-        Since the multi-arch support, has been changed to 10.
-        """
-        min_sdk = args.min_sdk_version
-        for i in args.version.split('.'):
-            version_code *= 100
-            version_code += int(i)
-        args.numeric_version = "{}{}{}".format("10", min_sdk, version_code)
+    generated_from_version = None
+    if args.numeric_version is None:
+        generated_from_version = args.version
+        args.numeric_version = get_android_numeric_version(
+            args.version,
+            args.min_sdk_version,
+        )
+    args.numeric_version = validate_android_numeric_version(
+        args.numeric_version,
+        generated_from_version=generated_from_version,
+    )
 
     if args.intent_filters:
         with open(args.intent_filters) as fd:
@@ -461,7 +531,7 @@ main.py that loads it.''')
         if exists(service_main) or exists(service_main + 'o'):
             service = True
 
-    service_names = []
+    service_data = []
     base_service_class = args.service_class_name.split('.')[-1]
     for sid, spec in enumerate(args.services):
         spec = spec.split(':')
@@ -471,8 +541,18 @@ main.py that loads it.''')
 
         foreground = 'foreground' in options
         sticky = 'sticky' in options
+        foreground_type_option = next((s for s in options if s.startswith('foregroundServiceType')), None)
+        foreground_type = None
+        if foreground_type_option:
+            parts = foreground_type_option.split('=', 1)
+            if len(parts) != 2 or not parts[1]:
+                raise ValueError(
+                    'Missing value for `foregroundServiceType` option. '
+                    'Expected format: foregroundServiceType=location'
+                )
+            foreground_type = parts[1]
 
-        service_names.append(name)
+        service_data.append((name, foreground_type))
         service_target_path =\
             'src/main/java/{}/Service{}.java'.format(
                 args.package.replace(".", "/"),
@@ -536,12 +616,12 @@ main.py that loads it.''')
     render_args = {
         "args": args,
         "service": service,
-        "service_names": service_names,
+        "service_data": service_data,
         "android_api": android_api,
         "debug": "debug" in args.build_mode,
-        "native_services": args.native_services
+        "native_services": args.native_services,
     }
-    if get_bootstrap_name() == "sdl2":
+    if is_sdl_bootstrap():
         render_args["url_scheme"] = url_scheme
 
     render(
@@ -596,7 +676,7 @@ main.py that loads it.''')
         "args": args,
         "private_version": hashlib.sha1(private_version.encode()).hexdigest()
     }
-    if get_bootstrap_name() == "sdl2":
+    if is_sdl_bootstrap():
         render_args["url_scheme"] = url_scheme
     render(
         'strings.tmpl.xml',
@@ -769,7 +849,7 @@ tools directory of the Android SDK.
     ap.add_argument('--private', dest='private',
                     help='the directory with the app source code files' +
                          ' (containing your main.py entrypoint)',
-                    required=(get_bootstrap_name() != "sdl2"))
+                    required=(not is_sdl_bootstrap()))
     ap.add_argument('--package', dest='package',
                     help=('The name of the java package the project will be'
                           ' packaged under.'),
@@ -778,16 +858,17 @@ tools directory of the Android SDK.
                     help=('The human-readable name of the project.'),
                     required=True)
     ap.add_argument('--numeric-version', dest='numeric_version',
-                    help=('The numeric version number of the project. If not '
-                          'given, this is automatically computed from the '
-                          'version.'))
+                    help=('The Android versionCode of the project. This must '
+                          'be a positive decimal integer no greater than '
+                          '{}. If not given, it is automatically computed '
+                          'from --version.').format(MAX_ANDROID_VERSION_CODE))
     ap.add_argument('--version', dest='version',
-                    help=('The version number of the project. This should '
-                          'consist of numbers and dots, and should have the '
-                          'same number of groups of numbers as previous '
-                          'versions.'),
+                    help=('The Android versionName of the project, shown to '
+                          'users as the display version. Use '
+                          '--numeric-version to control Android versionCode '
+                          'and update ordering.'),
                     required=True)
-    if get_bootstrap_name() == "sdl2":
+    if is_sdl_bootstrap():
         ap.add_argument('--launcher', dest='launcher', action='store_true',
                         help=('Provide this argument to build a multi-app '
                               'launcher, rather than a single app.'))
@@ -1044,7 +1125,7 @@ def parse_args_and_make_package(args=None):
         args.orientation, args.manifest_orientation
     )
 
-    if get_bootstrap_name() == "sdl2":
+    if is_sdl_bootstrap():
         args.sdl_orientation_hint = get_sdl_orientation_hint(args.orientation)
 
     if args.res_xmls and isinstance(args.res_xmls[0], list):
@@ -1073,10 +1154,9 @@ def parse_args_and_make_package(args=None):
                         if x.strip() and not x.strip().startswith('#')]
         WHITELIST_PATTERNS += patterns
 
-    if args.private is None and \
-            get_bootstrap_name() == 'sdl2' and args.launcher is None:
+    if args.private is None and is_sdl_bootstrap() and args.launcher is None:
         print('Need --private directory or ' +
-              '--launcher (SDL2 bootstrap only)' +
+              '--launcher (SDL2/SDL3 bootstrap only)' +
               'to have something to launch inside the .apk!')
         sys.exit(1)
     make_package(args)
